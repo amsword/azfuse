@@ -44,6 +44,8 @@ def robust_open_to_write(fname, mode):
 def create_cloud_storage(x=None, config_file=None, config=None):
     if config is not None:
         return CloudStorage(config)
+    if isinstance(x, dict):
+        return CloudStorage(x)
     if config_file is None:
         folder = get_azfuse_env(
             'STORAGE_ACCOUNT_CONFIG_FOLDER',
@@ -151,14 +153,21 @@ def blob_download_qdoutput(src_path, target_folder):
     c = create_cloud_storage('vig')
     c.blob_download_qdoutput(src_path, target_folder)
 
+def load_default_azfuse_config():
+    fname = get_azfuse_env(
+        'CLOUD_FUSE_CONFIG_FILE',
+        'aux_data/configs/azfuse.yaml',
+    )
+    logger.info(f'init azfuse from {fname}')
+    if op.isfile(fname):
+        config = load_from_yaml_file(fname)
+    else:
+        config = []
+    return config
+
 def create_cloud_fuse(config=None):
     if config is None:
-        fname = get_azfuse_env(
-            'CLOUD_FUSE_CONFIG_FILE',
-            'aux_data/configs/azfuse.yaml',
-        )
-        logger.info(f'init azfuse from {fname}')
-        config = load_from_yaml_file(fname)
+        config = load_default_azfuse_config()
     assert not isinstance(config, dict)
     return AzFuse(config)
 
@@ -319,8 +328,12 @@ def download_worker_entry(queue):
         fs = queue.pop(10)
         fuser.ensure_cache(fs)
 
-def launch_async_upload_thread(queue):
-    p = mp.Process(target=async_upload_thread_entry, args=(queue,))
+def launch_async_upload_thread(queue, use_thread=False):
+    if use_thread:
+        import threading
+        p = threading.Thread(target=async_upload_thread_entry, args=(queue,))
+    else:
+        p = mp.Process(target=async_upload_thread_entry, args=(queue,))
     p.start()
     return p
 
@@ -416,6 +429,13 @@ class AzFuse(object):
             os.remove(cache_file)
         return self.account2cloud[info['storage_account']].rm(remote_file)
 
+    def undelete(self, fname):
+        info = self.get_remote_cache(fname)
+        if len(info) == 0:
+            return
+        remote_file = op.join(info['remote'], info['sub_name'])
+        return self.account2cloud[info['storage_account']].undelete(remote_file)
+
     def send_to_async_upload(self, fname_or_fnames, clear_cache_after_upload=False):
         if isinstance(fname_or_fnames, str):
             fnames = [fname_or_fnames]
@@ -429,7 +449,7 @@ class AzFuse(object):
             self.async_upload_queue.put(info)
 
     @contextlib.contextmanager
-    def async_upload(self, enabled, shm_as_tmp=False):
+    def async_upload(self, enabled, shm_as_tmp=False, use_thread=False):
         old_enabled = self.async_upload_enabled
         old_shm = self.shm_as_upload_tmp
         old_async_upload_queue = self.async_upload_queue
@@ -439,7 +459,7 @@ class AzFuse(object):
         self.shm_as_upload_tmp = shm_as_tmp
         if enabled:
             async_upload_queue = mp.Manager().Queue()
-            async_upload_thread = launch_async_upload_thread(async_upload_queue)
+            async_upload_thread = launch_async_upload_thread(async_upload_queue, use_thread=use_thread)
             self.async_upload_queue = async_upload_queue
             self.async_upload_thread = async_upload_thread
         yield
@@ -564,13 +584,36 @@ class AzFuse(object):
                     config_infos = [(id(info['config_info']), info) for info in remote_cache_infos]
                     config2infos = list_to_dict(config_infos, 0)
                     for infos in config2infos.values():
-                        sns = [i['path_relative_to_config'] for i in infos]
                         config = infos[0]['config_info']
-                        rd = config['remote']
-                        cd = config['cache']
                         cloud = self.account2cloud[config['storage_account']]
 
-                        if len(sns) > 0:
+                        rd = config['remote']
+                        cd = config['cache']
+                        sns = [i['path_relative_to_config'] for i in infos]
+
+                        if op.basename(rd) != op.basename(cd):
+                            for s in sns:
+                                assert not s.startswith('/')
+                            root_sns =[(sn.split('/')[0], sn.split('/')[1:]) for sn in sns]
+                            root2sns = list_to_dict(root_sns, 0)
+                            for root, sub_sns in root2sns.items():
+                                sub_sns = [op.join(*s) for s in sub_sns]
+                                file_list = '/tmp/{}'.format(hash_sha1(pformat(sub_sns)))
+                                write_to_file('\n'.join(sub_sns), file_list)
+                                cloud.az_download(
+                                    op.join(rd, root),
+                                    op.join(cd, root),
+                                    is_folder=True,
+                                    file_list=file_list,
+                                    tmp_first=False,
+                                    sync=False,
+                                    retry=5,
+                                )
+                                for s in sub_sns:
+                                    if not op.isfile(op.join(cd, s)):
+                                        logging.error((op.join(cd, s), file_list))
+                            pass
+                        elif len(sns) > 0:
                             file_list = '/tmp/{}'.format(hash_sha1(pformat(sns)))
                             write_to_file('\n'.join(sns), file_list)
                             cloud = self.account2cloud[infos[0]['storage_account']]
@@ -637,7 +680,7 @@ class AzFuse(object):
         self.ensure_remote_to_cache(remote_file, cache_file, cloud,
                                     cache_lock=info.get('cache_lock'))
         after_to_cache = time.time()
-        wait_if_zero_file_size(cache_file)
+        # wait_if_zero_file_size(cache_file)
         ret = io.open(cache_file, mode)
         after_open = time.time()
         if after_open - start > 10:
@@ -750,7 +793,7 @@ class AzFuse(object):
         cloud = self.account2cloud[info['storage_account']]
         cloud.set_access_tier(op.join(info['remote'], info['sub_name']), tier)
 
-    def list(self, folder, recursive=False, return_info=False):
+    def list(self, folder, recursive=False, return_info=False, ls_deleted=False):
         info = self.get_remote_cache(folder)
         if len(info) == 0:
             return glob.glob(op.join(folder, '*'), recursive=recursive)
@@ -785,7 +828,7 @@ class AzFuse(object):
                 prefix = None
                 if remote_folder:
                     prefix = remote_folder + '/'
-                ret = list(cloud.iter_blob_info(prefix, recursive=recursive))
+                ret = list(cloud.iter_blob_info(prefix, recursive=recursive, deleted=ls_deleted))
                 if len(ret) == 0:
                     ret.append(cloud.query_info(remote_folder))
                 if not recursive:
@@ -932,6 +975,10 @@ class CloudStorage(object):
             blob = self.container_client.get_blob_client(path)
             blob.delete_blob()
 
+    def undelete(self, path):
+        blob = self.container_client.get_blob_client(path)
+        blob.undelete_blob()
+
     def iter_blob_info(self, prefix=None,
                        creation_time_larger_than=None,
                        deleted=False,
@@ -966,6 +1013,8 @@ class CloudStorage(object):
                     'deleted': b.deleted,
                     'lease_status': b.lease['status'],
                 }
+                if deleted:
+                    ret['deleted_time'] = b.deleted_time
                 yield ret
 
     def get_access_tier(self, blob_properties):
@@ -1086,7 +1135,6 @@ class CloudStorage(object):
                 cmd.append('sync')
             else:
                 cmd.append('cp')
-        cmd.append('--put-md5')
         url = 'https://{}.blob.core.windows.net'.format(from_blob.account_name)
         url = op.join(url, from_blob.container_name, src_dir)
         assert self.sas_token.startswith('?')
@@ -1153,7 +1201,7 @@ class CloudStorage(object):
         if file_list:
             cmd.append('--list-of-files')
             cmd.append(file_list)
-        if int(get_azfuse_env('AZCOPY_NO_LOG', '1')):
+        if int(get_azfuse_env('AZCOPY_NO_LOG', '0')):
             import subprocess
             stdout = subprocess.DEVNULL
             silent = True

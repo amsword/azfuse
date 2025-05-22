@@ -102,11 +102,11 @@ class File(object):
             return get_file_size(fname)
 
     @classmethod
-    def list(cls, folder, recursive=False, return_info=False):
+    def list(cls, folder, recursive=False, return_info=False, **kwargs):
         cls.ensure_initialized()
         if cls.use_fuser:
             return cls.fuser.list(folder, recursive=recursive,
-                                  return_info=return_info)
+                                  return_info=return_info, **kwargs)
         else:
             assert not return_info
             return glob.glob(op.join(folder, '*'), recursive=recursive)
