@@ -20,7 +20,7 @@ class File(object):
         if not cls.initialized:
             cls.initialized = True
             # TSV_USE_FUSE is only for back-compatibility
-            cls.use_fuser = int(get_azfuse_env('TSV_USE_FUSE', '0')) + int(get_azfuse_env('USE_FUSE', '0'))
+            cls.use_fuser = int(get_azfuse_env('TSV_USE_FUSE', '0')) + int(get_azfuse_env('USE_FUSE', '1'))
             if cls.use_fuser:
                 cls.fuser = create_cloud_fuse(config=config)
                 gc  = int(get_azfuse_env('USE_FUSE_ENABLE_GARBAGE_COLLECTION', '0'))
