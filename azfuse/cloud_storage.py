@@ -266,7 +266,7 @@ def async_upload_thread_entry(async_upload_queue):
                     if r2.get('clear_cache_after_upload'):
                         fsize = get_file_size(op.join(r2['cache'], r2['sub_name']))
                         total_size += fsize or 0
-                    if total_size > 1024 * 1024 * 1024 * 10:
+                    if total_size > 1024 * 1024 * 1024 * 100:
                         logger.info('there might be too many files to write. let us upload first')
                         break
         if len(all_info) > 0:
@@ -280,6 +280,7 @@ def async_upload_files(infos, account2cloud):
 
     config_infos = [(hash_sha1(pformat(info['config_info'])), info) for info in infos]
     config2infos = list_to_dict(config_infos, 0)
+    logger.info('config2infos = {}'.format(pformat(config2infos.keys())))
 
     for infos in config2infos.values():
         sns = [i['path_relative_to_config'] for i in infos]
@@ -291,6 +292,9 @@ def async_upload_files(infos, account2cloud):
         sns = list(set(sns))
         if ac not in account2cloud:
             account2cloud[ac] = create_cloud_storage(ac)
+        logger.info('rd = {}, cd = {}'.format(
+            rd, cd,
+        ))
         if op.basename(rd[:-1] if rd.endswith('/') else rd) == op.basename(cd[:-1] if cd.endswith('/') else cd):
             file_list = '/tmp/{}'.format(hash_sha1(pformat(sns)))
             write_to_file('\n'.join(sns), file_list)
@@ -303,6 +307,7 @@ def async_upload_files(infos, account2cloud):
             )
             ensure_remove_file(file_list)
         else:
+            logger.info('{} - {}'.format(cd, rd))
             for sn in sns:
                 account2cloud[ac].upload(
                     op.join(cd, sn),
@@ -342,7 +347,7 @@ class AzFuse(object):
         # config is a list of dictionary (local, remote, cache, storage_account)
         for c in config:
             c['local'] = op.abspath(c['local'])
-            c['cache'] = op.expanduser(c['cache'])
+            c['cache'] = op.abspath(op.expanduser(c['cache']))
         self.config = config
 
         accounts = set([c['storage_account'] for c in self.config])
@@ -360,6 +365,17 @@ class AzFuse(object):
         self._download_process = None
 
         #self._ignore_cache = False
+
+    def add_config(self, config):
+        for c in config:
+            c['local'] = op.abspath(c['local'])
+            c['cache'] = op.abspath(op.expanduser(c['cache']))
+        self.config.extend(config)
+        accounts = set([c['storage_account'] for c in config])
+        for a in accounts:
+            if a not in self.account2cloud:
+                self.account2cloud[a] = create_cloud_storage(a)
+
 
     def create_download_process(self, clear_queue=True):
         if self._download_process:
@@ -1053,10 +1069,10 @@ class CloudStorage(object):
                                                         blob_name)
         return '{}?{}'.format(url, sas)
 
-    def upload_stream(self, s, path, force=False, lease=None):
+    def upload_stream(self, s, path, force=False, lease=None, tags=None):
         if self.is_new_package:
             blob_client = self.container_client.get_blob_client(path)
-            blob_client.upload_blob(s, lease=lease, overwrite=force)
+            blob_client.upload_blob(s, lease=lease, overwrite=force, tags=tags)
         else:
             if not force and self.block_blob_service.exists(self.container_name,
                     path):
@@ -1112,18 +1128,18 @@ class CloudStorage(object):
     def az_sync(self, src_dir, dest_dir):
         self.upload(src_dir, dest_dir)
 
-    def upload(self, src_dir, dest_dir, from_blob=None, file_list=None):
+    def upload(self, src_dir, dest_dir, from_blob=None, file_list=None, tags=None):
         if from_blob is None:
-            self.upload_from_local(src_dir, dest_dir, file_list=file_list)
+            self.upload_from_local(src_dir, dest_dir, file_list=file_list, tags=tags)
         else:
-            assert file_list is None
+            assert file_list is None and tags is None
             self.upload_from_another(src_dir, dest_dir, from_blob)
 
-    def upload_from_another(self, src_dir, dest_dir, from_blob):
-        assert self.sas_token
+    def upload_from_another(self, src_dir, dest_dir, from_blob, file_list=None):
+        # assert self.sas_token
         cmd = []
         cmd.append(get_azcopy())
-        if from_blob.dir_exists(src_dir) and not self.dir_exists(dest_dir):
+        if from_blob.dir_exists(src_dir) and not self.dir_exists(dest_dir) or file_list is not None:
             # in this case, azcopy will copy the local folder under the
             # destination folder, and thus we have to use the folder of
             # dest_dir as the dest_dir.
@@ -1153,6 +1169,9 @@ class CloudStorage(object):
 
         if from_blob.dir_exists(src_dir):
             cmd.append('--recursive')
+        if file_list:
+            cmd.append('--list-of-files')
+            cmd.append(file_list)
         if from_url == data_url:
             logger.info('no need to sync data as url is exactly the same')
             return data_url, url
@@ -1166,7 +1185,7 @@ class CloudStorage(object):
         cmd_run(cmd, stdout=stdout, stderr=sp.PIPE, silent=silent)
         return data_url, url
 
-    def upload_from_local(self, src_dir, dest_dir, file_list=None):
+    def upload_from_local(self, src_dir, dest_dir, file_list=None, tags=None):
         assert self.sas_token
         cmd = []
         cmd.append(get_azcopy())
@@ -1175,7 +1194,7 @@ class CloudStorage(object):
             # in this case, azcopy will copy the local folder under the
             # destination folder, and thus we have to use the folder of
             # dest_dir as the dest_dir.
-            assert op.basename(src_dir) == op.basename(dest_dir)
+            assert op.basename(src_dir) == op.basename(dest_dir) or dest_dir == ''
             if dest_dir.endswith('/'):
                 dest_dir = dest_dir[:-1]
             dest_dir = op.dirname(dest_dir)
@@ -1192,9 +1211,10 @@ class CloudStorage(object):
         if dest_dir.startswith('/'):
             dest_dir = dest_dir[1:]
         url = op.join(url, self.container_name, dest_dir)
-        assert self.sas_token.startswith('?')
         data_url = url
-        url = url + self.sas_token
+        if self.sas_token:
+            assert self.sas_token.startswith('?')
+            url = url + self.sas_token
         cmd.append(url)
         if op.isdir(src_dir):
             cmd.append('--recursive')
@@ -1208,6 +1228,8 @@ class CloudStorage(object):
         else:
             stdout = None
             silent = False
+        if tags:
+            cmd.append('--blob-tags={}'.format('&'.join([f'{k}={v}' for k, v in tags.items()])))
         cmd_run(cmd, stdout=stdout, silent=silent)
         return data_url, url
 
@@ -1490,7 +1512,20 @@ class CloudStorage(object):
 
     def read(self, path, offset=None, length=None):
         blob_client = self.container_client.get_blob_client(path)
-        return limited_retry_agent(-1, lambda: blob_client.download_blob(offset=offset, length=length).readall())
+        # return limited_retry_agent(-1, lambda: blob_client.download_blob(offset=offset, length=length).readall())
+        while True:
+            try:
+                ret = blob_client.download_blob(offset=offset, length=length).readall()
+                return ret
+            except:
+                logger.info('retry to read blob {} offset {} length {}, {}, {}'.format(
+                    path, offset, length,
+                    self.account_name,
+                    self.container_name,
+                ))
+                time.sleep(5)
+                continue
+        # return limited_retry_agent(-1, lambda: blob_client.download_blob(offset=offset, length=length).readall())
 
     def get_metadata(self, path):
         blob_client = self.container_client.get_blob_client(path)
@@ -1605,5 +1640,7 @@ class CloudStorage(object):
                     self.az_download(f, target_f)
             except:
                 pass
-                    #self.download_to_path(f, target_f)
+                #self.download_to_path(f, target_f)
+    def find_blobs_by_tags(self, tag_query):
+        return self.container_client.find_blobs_by_tags(tag_query)
 
